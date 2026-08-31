@@ -1,8 +1,18 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- ONLINE-ONLY app (v0.9.2): prices/search come from the network, so the
+         INTERNET permission is declared explicitly here instead of relying on
+         a transitive plugin manifest merge (debug/profile manifests only add
+         it for the Flutter tooling). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="NeoVault"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        tools:targetApi="31">
         <activity
             android:name=".MainActivity"
             android:exported="true"

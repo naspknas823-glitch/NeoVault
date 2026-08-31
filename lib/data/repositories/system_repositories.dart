@@ -270,7 +270,8 @@ class PinRepository {
         .write(PinMetaCompanion(autolockMinutes: Value(minutes)));
   }
 
-  /// Verify + lockout state machine (⛔ 5 fails → 30 s; 10 → sign out).
+  /// Verify + lockout state machine (⛔ 3 fails → 30 s block, re-armed on
+  /// every further failure; 10 fails → sign out).
   Future<PinVerifyResult> verify(String pin, {required bool isAuthed}) async {
     final row = await _row();
     final nowMs = DateTime.now().millisecondsSinceEpoch;
@@ -281,11 +282,23 @@ class PinRepository {
         row.salt != null &&
         PinSecurity.verify(pin, row.salt!, row.pinHash!);
     if (ok) {
+      // Transparent KDF upgrade: a hash written by an older build (weaker
+      // cost / legacy format) is re-derived with the current parameters the
+      // first time the correct PIN is entered — no schema migration and no
+      // forced PIN re-enrollment (⛔ §8.3).
+      final needsUpgrade = PinSecurity.needsRehash(row.pinHash!);
       await (_db.update(_db.pinMeta)..where((t) => t.id.equals('main'))).write(
-        const PinMetaCompanion(failedAttempts: Value(0), lockedUntil: Value(null)),
+        PinMetaCompanion(
+          pinHash: needsUpgrade
+              ? Value(PinSecurity.hash(pin, row.salt!))
+              : const Value.absent(),
+          failedAttempts: const Value(0),
+          lockedUntil: const Value(null),
+        ),
       );
       return const PinVerifyResult.success();
     }
+
     final next = lockout.registerFailure(nowMs);
     await (_db.update(_db.pinMeta)..where((t) => t.id.equals('main'))).write(
       PinMetaCompanion(

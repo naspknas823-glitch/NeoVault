@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Legacy (API 23–30) Auto Backup policy.
+
+  ⛔ SECURITY (§8.3): kept as defence in depth next to
+  `android:allowBackup="false"` — if the flag is ever flipped back on, these
+  rules still keep the SQLCipher vault, shared preferences and any app files
+  out of Google Drive backups.
+-->
+<full-backup-content>
+    <exclude domain="root" />
+    <exclude domain="file" />
+    <exclude domain="database" />
+    <exclude domain="sharedpref" />
+    <exclude domain="external" />
+</full-backup-content>
