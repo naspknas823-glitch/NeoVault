@@ -395,7 +395,12 @@ class AppConfigTable extends Table {
 
 class PinMeta extends Table {
   TextColumn get id => text()(); // singleton 'main'
-  TextColumn get pinHash => text().nullable()(); // PBKDF2 hash — Keystore-backed salt
+  // PBKDF2-HMAC-SHA256 digest in the self-describing format
+  // `pbkdf2-sha256$<iterations>$<base64>` (legacy rows: bare base64).
+  TextColumn get pinHash => text().nullable()();
+  // ⚠️ The salt lives in THIS table, not in the Keystore. What protects it is
+  // the SQLCipher encryption of the whole database, whose passphrase is
+  // Keystore-only (see data/repositories/providers.dart).
   TextColumn get salt => text().nullable()();
   IntColumn get failedAttempts => integer().withDefault(const Constant(0))();
   IntColumn get lockedUntil => integer().nullable()();

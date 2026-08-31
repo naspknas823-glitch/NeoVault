@@ -1,8 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' show Random;
 
 import 'package:drift/drift.dart';
 import 'package:drift/native.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as p;
@@ -50,16 +52,21 @@ Future<AppDatabase> openRealDatabase({bool encrypted = true}) async {
   final file = File(p.join(dir.path, 'neovault.sqlite'));
   ensureSqlCipherLoaded();
   if (encrypted) {
-    final passphrase = await _resolveDbPassphrase(dir);
+    // Throws [KeystoreUnavailableException] when the Keystore cannot hold the
+    // passphrase — main.dart turns that into the BootstrapErrorApp screen
+    // (fail-fast: ⛔ we never downgrade to an unencrypted / plaintext-keyed
+    // vault just to make the launch succeed).
+    final passphrase = await resolveDbPassphrase(dir: dir);
     // Builds before the SQLCipher fix wrote a PLAINTEXT file (system sqlite
     // ignored PRAGMA key). SQLCipher cannot read those (SQLITE_NOTADB) →
     // park the legacy file and start a fresh encrypted vault.
     await _parkLegacyPlaintextDb(file);
+    final keyPragma = pragmaKeyStatement(passphrase);
     return AppDatabase(
       NativeDatabase.createInBackground(
         file,
         setup: (raw) {
-          raw.execute("PRAGMA key = '$passphrase';");
+          raw.execute(keyPragma);
           raw.execute('PRAGMA cipher_page_size = 4096;');
         },
         isolateSetup: () async {
@@ -73,31 +80,186 @@ Future<AppDatabase> openRealDatabase({bool encrypted = true}) async {
   return AppDatabase(NativeDatabase.createInBackground(file));
 }
 
-/// Passphrase lifecycle (⛔ §8.3): Keystore-backed secure storage first.
-/// A broken Keystore (e.g. PlatformException BAD_DECRYPT after reinstalling
-/// a debug build) must never block the launch — degrade to a key file inside
-/// the app-private sandbox instead of dying with a white screen. This is a
-/// documented graceful-degradation path, still fully local.
-Future<String> _resolveDbPassphrase(Directory dir) async {
-  const secure = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
-  );
+/// ── SQLCipher passphrase lifecycle (⛔ §8.3) ────────────────────────────
+/// Secure-storage entry holding the vault passphrase (Android Keystore via
+/// EncryptedSharedPreferences).
+const String kDbPassphraseStorageKey = 'nv_db_key';
+
+/// Plaintext key file written by builds ≤ v0.9.0+9 as a Keystore fallback.
+/// ⛔ It is NEVER written any more; it is only adopted once (so an existing
+/// vault stays readable) and then shredded — see [resolveDbPassphrase].
+const String kLegacyPlaintextKeyFileName = '.nv_db_key';
+
+/// Which step of the Keystore round-trip failed.
+enum KeystoreFailureStage { read, write, verify }
+
+/// The Keystore-backed secure storage cannot hold the SQLCipher passphrase.
+///
+/// ⛔ SECURITY: there is deliberately NO fallback. Older builds degraded to a
+/// plaintext `.nv_db_key` file next to the encrypted database, which handed
+/// anyone with filesystem access both the vault and its key. NeoVault now
+/// refuses to open the vault instead, and `main.dart` renders the
+/// `BootstrapErrorApp` screen with this (honest) message plus a Retry action.
+class KeystoreUnavailableException implements Exception {
+  const KeystoreUnavailableException(this.stage, [this.cause]);
+
+  final KeystoreFailureStage stage;
+  final Object? cause;
+
+  String get _detail => switch (stage) {
+        KeystoreFailureStage.read =>
+          'reading the existing vault key from secure storage failed',
+        KeystoreFailureStage.write =>
+          'storing a newly generated vault key in secure storage failed',
+        KeystoreFailureStage.verify =>
+          'the vault key could not be read back after writing '
+              '(secure storage silently dropped it)',
+      };
+
+  @override
+  String toString() {
+    final because = cause == null ? '' : '\nCause: $cause';
+    return 'KeystoreUnavailableException: Android Keystore-backed secure '
+        'storage is unavailable — $_detail.\n'
+        'The SQLCipher passphrase is kept ONLY in the Keystore and is never '
+        'written to disk, Drift or SharedPreferences in plaintext, so the '
+        'encrypted vault cannot be opened on this device right now.'
+        '$because';
+  }
+}
+
+/// Injection seams so the passphrase policy is unit-testable without a
+/// platform channel (see test/unit/db_security_test.dart).
+typedef SecureRead = Future<String?> Function(String key);
+typedef SecureWrite = Future<void> Function(String key, String value);
+
+const FlutterSecureStorage _secureStorage = FlutterSecureStorage(
+  aOptions: AndroidOptions(encryptedSharedPreferences: true),
+);
+
+Future<String?> _defaultSecureRead(String key) => _secureStorage.read(key: key);
+
+Future<void> _defaultSecureWrite(String key, String value) =>
+    _secureStorage.write(key: key, value: value);
+
+/// 256-bit passphrase from a CSPRNG, hex-encoded.
+///
+/// Hex (not UUID v4) on purpose: 256 bits instead of 122, and the alphabet
+/// `[0-9a-f]` cannot carry a quote/control character into the `PRAGMA key`
+/// statement (defence in depth on top of [pragmaKeyStatement]).
+@visibleForTesting
+String generateDbPassphrase({Random? rng}) {
+  final r = rng ?? Random.secure();
+  final bytes = List<int>.generate(32, (_) => r.nextInt(256));
+  return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+}
+
+/// Builds the `PRAGMA key` statement safely.
+///
+/// SQLite does not accept bound parameters in PRAGMA statements, so the value
+/// must be embedded — but as a properly escaped SQL string literal (single
+/// quotes doubled) rather than raw interpolation. Control characters (incl.
+/// NUL and newlines) are rejected outright: they cannot occur in a key we
+/// generate, so their presence means a corrupted/hostile value.
+@visibleForTesting
+String pragmaKeyStatement(String passphrase) {
+  if (passphrase.isEmpty) {
+    throw ArgumentError.value(
+        passphrase, 'passphrase', 'SQLCipher passphrase must not be empty');
+  }
+  for (final unit in passphrase.codeUnits) {
+    if (unit < 0x20 || unit == 0x7F) {
+      throw ArgumentError.value(passphrase, 'passphrase',
+          'SQLCipher passphrase must not contain control characters');
+    }
+  }
+  final escaped = passphrase.replaceAll("'", "''");
+  return "PRAGMA key = '$escaped';";
+}
+
+/// Resolves the vault passphrase from Keystore-backed secure storage.
+///
+/// Policy (⛔ §8.3):
+///  1. Keystore read fails → [KeystoreUnavailableException] (fail-fast).
+///  2. Key present → use it (and shred any leftover legacy plaintext file).
+///  3. No key, but a legacy plaintext `.nv_db_key` exists → adopt it ONCE so
+///     the existing vault stays readable, move it into the Keystore, then
+///     shred the plaintext copy.
+///  4. Nothing stored → generate a fresh 256-bit key.
+///  5. Every write is read back; a silent write failure must not produce a
+///     vault that can never be reopened.
+///
+/// ⛔ No branch of this function ever writes the passphrase to disk, Drift or
+/// SharedPreferences.
+@visibleForTesting
+Future<String> resolveDbPassphrase({
+  required Directory dir,
+  SecureRead? read,
+  SecureWrite? write,
+  String Function()? generate,
+}) async {
+  final secureRead = read ?? _defaultSecureRead;
+  final secureWrite = write ?? _defaultSecureWrite;
+  final legacyFile = File(p.join(dir.path, kLegacyPlaintextKeyFileName));
+
+  String? stored;
   try {
-    var passphrase = await secure.read(key: 'nv_db_key');
-    if (passphrase == null || passphrase.isEmpty) {
-      passphrase = const Uuid().v4();
-      await secure.write(key: 'nv_db_key', value: passphrase);
-    }
-    return passphrase;
+    stored = await secureRead(kDbPassphraseStorageKey);
+  } catch (e) {
+    throw KeystoreUnavailableException(KeystoreFailureStage.read, e);
+  }
+
+  if (stored != null && stored.isNotEmpty) {
+    await _shredLegacyKeyFile(legacyFile);
+    return stored;
+  }
+
+  final adopted = _readLegacyKeyFile(legacyFile);
+  final passphrase = adopted ?? (generate ?? generateDbPassphrase)();
+
+  try {
+    await secureWrite(kDbPassphraseStorageKey, passphrase);
+  } catch (e) {
+    throw KeystoreUnavailableException(KeystoreFailureStage.write, e);
+  }
+
+  String? confirmed;
+  try {
+    confirmed = await secureRead(kDbPassphraseStorageKey);
+  } catch (e) {
+    throw KeystoreUnavailableException(KeystoreFailureStage.verify, e);
+  }
+  if (confirmed != passphrase) {
+    throw const KeystoreUnavailableException(KeystoreFailureStage.verify);
+  }
+
+  await _shredLegacyKeyFile(legacyFile);
+  return passphrase;
+}
+
+/// One-time adoption of a pre-fix plaintext key (never written again).
+String? _readLegacyKeyFile(File legacyFile) {
+  try {
+    if (!legacyFile.existsSync()) return null;
+    final raw = legacyFile.readAsStringSync().trim();
+    return raw.isEmpty ? null : raw;
   } on Exception {
-    final keyFile = File(p.join(dir.path, '.nv_db_key'));
-    if (keyFile.existsSync()) {
-      final existing = keyFile.readAsStringSync().trim();
-      if (existing.isNotEmpty) return existing;
+    return null;
+  }
+}
+
+/// Best-effort removal of the leaked plaintext key: overwrite the bytes
+/// before unlinking so a simple undelete does not resurrect the secret.
+Future<void> _shredLegacyKeyFile(File legacyFile) async {
+  try {
+    if (!legacyFile.existsSync()) return;
+    final length = await legacyFile.length();
+    if (length > 0) {
+      await legacyFile.writeAsBytes(List<int>.filled(length, 0), flush: true);
     }
-    final generated = const Uuid().v4();
-    await keyFile.writeAsString(generated, flush: true);
-    return generated;
+    await legacyFile.delete();
+  } on Exception {
+    // Best effort: the key is already superseded by the Keystore entry.
   }
 }
 
